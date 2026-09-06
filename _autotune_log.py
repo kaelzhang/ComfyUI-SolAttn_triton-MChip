@@ -2,6 +2,11 @@
 
 Each new sequence length makes every autotuned kernel benchmark its configs,
 stalling for seconds; without a log line that reads as a mysterious hang.
+
+Triton is optional. It has no Apple Silicon backend, and the node still needs
+``set_verbose`` there, so the import is guarded and every Triton-specific helper
+degrades to a no-op. The autotune dictionaries below are only ever read by the
+Triton kernel modules, which do not import at all without it.
 """
 
 import inspect
@@ -9,7 +14,11 @@ import logging
 import time
 
 import torch
-import triton
+
+try:
+    import triton
+except ImportError:
+    triton = None
 
 _verbose = False
 
@@ -41,6 +50,8 @@ def _supported_autotune_kwargs():
     Triton that predates it raises TypeError while the module is still being
     imported, which takes the whole node down rather than losing one feature.
     """
+    if triton is None:
+        return {}
     params = inspect.signature(triton.autotune).parameters
     extras = {}
     if "cache_results" in params:
@@ -84,6 +95,8 @@ def set_verbose(enabled):
 
 def wrap(kernel, label):
     """Log when this autotuner resolves a new key (verbose mode only)."""
+    if triton is None:
+        return kernel
     original_run = kernel.run
 
     def run(*args, **kwargs):
