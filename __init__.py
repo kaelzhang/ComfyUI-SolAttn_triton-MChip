@@ -159,7 +159,7 @@ def _ineligible(backend, q, k, mask, dim_head, min_tokens):
     """Why this call can't use Sol-Attn, or None if it can. q/k are BTHD."""
     if isinstance(backend, str):
         return backend                       # no backend for this device
-    rejected = backend.rejects(q.dtype, dim_head, q.shape[1])
+    rejected = backend.rejects(q.dtype, dim_head)
     if rejected is not None:
         return rejected
     if mask is not None:
@@ -196,6 +196,11 @@ def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
 
     # No contiguous() here: the kernels take strides, so H3's interleaved qkv
     # views go in without copies.
+    if backend.below_break_even(qs.shape[1]):
+        _log_once(("short", backend.name, qs.shape[1]),
+                  f"seq {qs.shape[1]} is short for the {backend.name} backend; if this "
+                  f"run is slower than without the node, raise min_tokens past "
+                  f"{backend.break_even}")
     int8 = int8_qk and backend.supports_int8
     if int8_qk and not int8:
         _log_once(("no_int8", backend.name),

@@ -66,19 +66,24 @@ class Backend:
         self.head_dim = head_dim          # None: any
         self.supports_int8 = supports_int8
         self._has_tma = has_tma
-        # Below this sequence length the backend is slower than the host's dense
-        # attention, so it declines rather than making the model slower. It is a
-        # floor under the node's own min_tokens, never a substitute for it.
+        # Advisory only. Isolated microbenchmarks put this backend behind the
+        # host's attention below ~8k tokens, but an end-to-end MiniMax H3 run at
+        # 5607 tokens measured 1.17x faster with it on -- real attention is far
+        # more concentrated than the random tensors the microbenchmark used, so
+        # the density at a given tau is several times lower. The number is not a
+        # reliable cutoff, so it warns once and defers to the node's min_tokens
+        # rather than refusing work the user asked for.
         self.break_even = break_even
 
     def has_tma(self, device):
         return bool(self._has_tma and self._has_tma(device))
 
-    def rejects(self, dtype, head_dim, tokens=None):
+    def below_break_even(self, tokens):
+        """Whether this call is in the range where the backend may not pay off."""
+        return bool(self.break_even and tokens is not None and tokens < self.break_even)
+
+    def rejects(self, dtype, head_dim):
         """Why this backend cannot take the call, or None."""
-        if tokens is not None and tokens < self.break_even:
-            return (f"seq {tokens} below this backend's break-even "
-                    f"{self.break_even}")
         if dtype not in self.dtypes:
             names = "/".join(str(d).rsplit(".", 1)[-1] for d in self.dtypes)
             return f"dtype {dtype} (this backend takes {names})"

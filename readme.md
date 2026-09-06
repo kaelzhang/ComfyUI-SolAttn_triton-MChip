@@ -96,10 +96,12 @@ on long sequences the way plain SDPA does (SDPA asks for a 103 GB allocation at
 
 Three things worth reading off that table.
 
-**Below ~8k tokens the sparse path loses.** Routing, the gather and the
-per-chunk bookkeeping cost more than the attention they remove. The backend
-therefore declines anything shorter and lets the host's attention handle it, so
-a short call cannot be made slower by installing this node.
+**Below ~8k tokens the sparse path loses here.** Routing, the gather and the
+per-chunk bookkeeping cost more than the attention they remove. Note the *here*
+-- see the end-to-end numbers below, where a 5607-token run came out ahead
+anyway. Random tensors are the worst case for a method that exists to exploit
+concentrated attention, so this figure is a warning, not a cutoff: the backend
+logs a hint below it and still takes the call.
 
 **The gain grows sharply with length.** By 32768 tokens the baseline is
 degrading super-quadratically under memory pressure while the sparse path stays
@@ -112,6 +114,39 @@ sequence. Tune tau before anything else.
 
 These are random-tensor figures, which is the pessimistic case: routing density
 at a fixed tau is several times lower on structured inputs than on noise.
+
+### End to end
+
+The isolated numbers above measure one attention call. What a whole generation
+does is a different question, so here is a real MiniMax H3 image-to-video run on
+the same machine -- 480x832, 25 frames, 4 steps with the 4-step distilled LoRA,
+which packs to 5607 tokens per attention call -- against
+[TE-Speed-MiniMaxH3-MChip](https://github.com/kaelzhang/TE-Speed-MiniMaxH3-MChip),
+the block cache this composes with:
+
+| | wall clock | vs baseline |
+|---|---|---|
+| neither | 617.6 s | — |
+| Sol-Attn alone (tau=1.3) | 526.8 s | 1.17x |
+| block cache alone | 301.1 s | 2.05x |
+| both | 376.0 s | 1.64x |
+
+Two things this says that the microbenchmark did not.
+
+Sol-Attn helped at 5607 tokens, below the break-even the isolated benchmark
+predicted. Real attention is concentrated where random tensors are flat, so the
+routing keeps far fewer blocks exact than the synthetic figures suggest.
+
+**The two accelerators did not compose here** -- adding Sol-Attn on top of the
+block cache cost 75 s rather than saving any. The plausible reading is that the
+cache already skips half the blocks, so Sol-Attn's fixed per-call preprocessing
+is amortised over less work while its benefit at this short sequence is small.
+At this sequence length, use the block cache alone.
+
+> [!WARNING]
+> One run per configuration, on a machine that was not otherwise idle. Treat the
+> ordering as real and the exact percentages as indicative. The composition
+> result in particular deserves repeating before anyone builds on it.
 
 Scores are computed in the input dtype. `bmm` rounds its output to that dtype
 regardless, so at fp16 the kernel carries roughly 5e-3 relative error against
