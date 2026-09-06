@@ -159,7 +159,7 @@ def _ineligible(backend, q, k, mask, dim_head, min_tokens):
     """Why this call can't use Sol-Attn, or None if it can. q/k are BTHD."""
     if isinstance(backend, str):
         return backend                       # no backend for this device
-    rejected = backend.rejects(q.dtype, dim_head)
+    rejected = backend.rejects(q.dtype, dim_head, q.shape[1])
     if rejected is not None:
         return rejected
     if mask is not None:

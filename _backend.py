@@ -59,19 +59,26 @@ class Backend:
     """One device's implementation, plus what it will and will not accept."""
 
     def __init__(self, name, dispatch, *, dtypes, head_dim=None,
-                 supports_int8=False, has_tma=None):
+                 supports_int8=False, has_tma=None, break_even=0):
         self.name = name
         self._dispatch = dispatch
         self.dtypes = dtypes
         self.head_dim = head_dim          # None: any
         self.supports_int8 = supports_int8
         self._has_tma = has_tma
+        # Below this sequence length the backend is slower than the host's dense
+        # attention, so it declines rather than making the model slower. It is a
+        # floor under the node's own min_tokens, never a substitute for it.
+        self.break_even = break_even
 
     def has_tma(self, device):
         return bool(self._has_tma and self._has_tma(device))
 
-    def rejects(self, dtype, head_dim):
+    def rejects(self, dtype, head_dim, tokens=None):
         """Why this backend cannot take the call, or None."""
+        if tokens is not None and tokens < self.break_even:
+            return (f"seq {tokens} below this backend's break-even "
+                    f"{self.break_even}")
         if dtype not in self.dtypes:
             names = "/".join(str(d).rsplit(".", 1)[-1] for d in self.dtypes)
             return f"dtype {dtype} (this backend takes {names})"
@@ -120,8 +127,12 @@ def select(device):
             return loaded(q, k, v, scale=scale, tau=tau,
                           sink_blocks=sink_blocks, sink_q=sink_q)
 
+        # Measured on an M3 Max against ComfyUI's own MPS attention: the sparse
+        # path loses below ~8k tokens, where the routing and gather overheads
+        # outweigh the work they remove, and wins from there upward.
         return Backend("torch", dispatch,
-                       dtypes=(torch.float16, torch.bfloat16, torch.float32))
+                       dtypes=(torch.float16, torch.bfloat16, torch.float32),
+                       break_even=8192)
 
     return f"no Sol-Attn backend for device type {kind!r}"
 

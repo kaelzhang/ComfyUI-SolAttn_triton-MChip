@@ -43,10 +43,10 @@ below for the measured figures and the machine they were taken on.
 > [!NOTE]
 > This project is a work in progress, and the two backends are not equally
 > exercised. The Triton path has been tested end to end on RTX 4090 and RTX
-> 5090 with MiniMax H3. On Apple Silicon what has been verified is the kernel
-> against dense attention, the ComfyUI override plumbing, and the benchmarks
-> below; a full MiniMax H3 generation on a Mac has **not** been run yet, so
-> treat the portable path as tested at the kernel level rather than end to end.
+> 5090 with MiniMax H3. On Apple Silicon the kernel is verified against dense
+> attention, the ComfyUI override plumbing is verified against ComfyUI 0.33.0,
+> the figures below are measured, and a MiniMax H3 sampling run completes with
+> the override installed. Long-run image quality on a Mac has not been assessed.
 
 ## Usage notes
 
@@ -75,23 +75,39 @@ exists to reach CUDA's INT8 tensor cores, which have no Metal equivalent.
 
 ### Measured
 
-`B=1 H=24 D=128`, fp16, against PyTorch's own MPS attention
-(`scaled_dot_product_attention`), best of three runs after warm-up:
+MiniMax H3's own attention shape -- `B=1 H=42 D=128`, bf16 -- against the
+attention ComfyUI actually selects on this machine. That baseline matters: on
+MPS ComfyUI picks `attention_sub_quad`, not
+`scaled_dot_product_attention`, and the two are nowhere near each other. The
+sub-quadratic path never materialises the score matrix, so it does not fall over
+on long sequences the way plain SDPA does (SDPA asks for a 103 GB allocation at
+32768 tokens and dies); it is simply slow.
 
-| tokens | `scaled_dot_product_attention` | Sol-Attn tau=1.3 | tau=2.0 |
+| tokens | `attention_sub_quad` | Sol-Attn tau=1.3 | tau=2.0 |
 |---|---|---|---|
-| 4096 | 49 ms | 33 ms (1.5x) | 29 ms (1.7x) |
-| 8192 | 204 ms | 83 ms (2.5x) | 112 ms (1.8x) |
-| 16384 | 1669 ms | 663 ms (2.5x) | 365 ms (**4.6x**) |
-| 32768 | **out of memory** | 2181 ms | 1081 ms |
+| 4096 | 41 ms | 75 ms (0.55x) | 56 ms (0.73x) |
+| 8192 | 646 ms | 463 ms (1.39x) | 296 ms (2.18x) |
+| 16384 | 2407 ms | 1228 ms (1.96x) | 646 ms (3.72x) |
+| 32768 | 79.5 s | 14.9 s (5.32x) | 1.9 s (**42x**) |
 
-Two things are worth reading off that table. The gain grows with sequence
-length, because MPS attention materialises the whole score matrix -- at 32768
-tokens it asks for a 103 GB allocation and dies, while the sparse path streams
-query blocks in bounded memory and finishes. And these are random-tensor
-figures, which are the pessimistic case: routing density at a fixed tau is
-several times lower on structured inputs than on noise, so real sampling sits
-further ahead than this.
+Three things worth reading off that table.
+
+**Below ~8k tokens the sparse path loses.** Routing, the gather and the
+per-chunk bookkeeping cost more than the attention they remove. The backend
+therefore declines anything shorter and lets the host's attention handle it, so
+a short call cannot be made slower by installing this node.
+
+**The gain grows sharply with length.** By 32768 tokens the baseline is
+degrading super-quadratically under memory pressure while the sparse path stays
+bounded, which is where the 42x at tau=2.0 comes from -- most of it is the
+baseline falling apart, not the kernel getting faster.
+
+**tau dominates at scale.** 1.3 and 2.0 differ by 8x at 32768 tokens, far more
+than at 8192, because the density difference multiplies against a much larger
+sequence. Tune tau before anything else.
+
+These are random-tensor figures, which is the pessimistic case: routing density
+at a fixed tau is several times lower on structured inputs than on noise.
 
 Scores are computed in the input dtype. `bmm` rounds its output to that dtype
 regardless, so at fp16 the kernel carries roughly 5e-3 relative error against
