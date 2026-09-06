@@ -1,13 +1,19 @@
 <h1 align="center">ComfyUI-SolAttn</h1>
 
 <h4 align="center">
-  Experimental Sol-Attn for ComfyUI, on CUDA and Apple Silicon
+  Experimental Sol-Attn for ComfyUI &mdash; CUDA and Apple Silicon
 </h4>
 
 <p align="center">
   <a href="https://arxiv.org/abs/2607.24027"><img src="https://img.shields.io/badge/📄_Paper-arXiv-b31b1b?style=flat-square" alt="Paper"/></a>
   <a href="https://github.com/NVlabs/Sana/tree/sol-engine/techniques/sparse_backends/sol_attn"><img src="https://img.shields.io/badge/💻_Code-Sol--Attn-76b900?style=flat-square" alt="Code"/></a>
   <a href="https://nvlabs.github.io/Sana/Sol-Attn/"><img src="https://img.shields.io/badge/🌐_Project-Page-blue?style=flat-square" alt="Project Page"/></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Apple_Silicon-supported-000000?style=flat-square&logo=apple&logoColor=white" alt="Apple Silicon supported"/>
+  <img src="https://img.shields.io/badge/backend-MPS_%7C_CUDA_%7C_CPU-4a4a4a?style=flat-square" alt="Backends"/>
+  <img src="https://img.shields.io/badge/benchmarked-M3_Max-000000?style=flat-square&logo=apple&logoColor=white" alt="Benchmarked on M3 Max"/>
 </p>
 
 ---
@@ -31,9 +37,16 @@ configuring; options a backend has no path for are logged once and ignored
 rather than failing. Routing, thresholding, the pooled-key approximation and
 the conditioning sinks are the same computation on both.
 
+**Apple Silicon is supported and benchmarked** &mdash; see [Apple Silicon](#apple-silicon)
+below for the measured figures and the machine they were taken on.
+
 > [!NOTE]
-> This project is a work in progress. The Triton path has been tested on RTX
-> 4090 and RTX 5090; the portable path on an M3 Max. Both with MiniMax H3.
+> This project is a work in progress, and the two backends are not equally
+> exercised. The Triton path has been tested end to end on RTX 4090 and RTX
+> 5090 with MiniMax H3. On Apple Silicon what has been verified is the kernel
+> against dense attention, the ComfyUI override plumbing, and the benchmarks
+> below; a full MiniMax H3 generation on a Mac has **not** been run yet, so
+> treat the portable path as tested at the kernel level rather than end to end.
 
 ## Usage notes
 
@@ -51,14 +64,26 @@ operations: the same routing, the same diagonal-Gaussian threshold, the same
 pooled-key approximation for unselected blocks. Only INT8 is absent, and that
 exists to reach CUDA's INT8 tensor cores, which have no Metal equivalent.
 
-Measured on an M3 Max, `B=1 H=24 D=128`, against PyTorch's MPS attention:
+### Test machine
+
+| | |
+|---|---|
+| Chip | Apple M3 Max &mdash; 16-core CPU (12P + 4E), 40-core GPU |
+| Memory | 128 GB unified |
+| OS | macOS 15.4.1 (24E263), Metal 3 |
+| Runtime | PyTorch 2.9.1, Python 3.12.9 |
+
+### Measured
+
+`B=1 H=24 D=128`, fp16, against PyTorch's own MPS attention
+(`scaled_dot_product_attention`), best of three runs after warm-up:
 
 | tokens | `scaled_dot_product_attention` | Sol-Attn tau=1.3 | tau=2.0 |
 |---|---|---|---|
-| 4096 | 49 ms | 33 ms | 29 ms |
-| 8192 | 204 ms | 83 ms | 112 ms |
-| 16384 | 1669 ms | 663 ms | 365 ms |
-| 32768 | out of memory | 2181 ms | 1081 ms |
+| 4096 | 49 ms | 33 ms (1.5x) | 29 ms (1.7x) |
+| 8192 | 204 ms | 83 ms (2.5x) | 112 ms (1.8x) |
+| 16384 | 1669 ms | 663 ms (2.5x) | 365 ms (**4.6x**) |
+| 32768 | **out of memory** | 2181 ms | 1081 ms |
 
 Two things are worth reading off that table. The gain grows with sequence
 length, because MPS attention materialises the whole score matrix -- at 32768
@@ -72,6 +97,12 @@ Scores are computed in the input dtype. `bmm` rounds its output to that dtype
 regardless, so at fp16 the kernel carries roughly 5e-3 relative error against
 an fp32 reference -- the same order as the method's own approximation at
 tau=1.3, and it does not grow with sparsity.
+
+On the machine above the suite below passes on both `mps` and `cpu`: the
+all-exact path reproduces dense attention to 3.6e-5 - 1.8e-3 across batch,
+head-count, head-dim and ragged-length combinations, and routing density lands
+at 15.6% / 6.7% / 2.3% for tau 1.0 / 1.5 / 2.0 against the paper's 16% / 7% /
+2.7%.
 
 To check a port or a change:
 
