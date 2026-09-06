@@ -16,6 +16,10 @@
   <img src="https://img.shields.io/badge/benchmarked-M3_Max-000000?style=flat-square&logo=apple&logoColor=white" alt="Benchmarked on M3 Max"/>
 </p>
 
+<p align="center">
+  <b>English</b> &nbsp;|&nbsp; <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 ---
 
 ## Overview
@@ -169,3 +173,9 @@ If you find Sol-Attn useful in your work, please cite the paper:
   year={2026}
 }
 ```
+
+---
+
+> This document and [README.zh-CN.md](README.zh-CN.md) are translations of each
+> other and must be changed together: an edit to one needs the same edit in the
+> other.
