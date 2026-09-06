@@ -3,6 +3,11 @@
 The "Patch Sol-Attn" node installs an ``optimized_attention_override`` on the
 model, keeping the patch per-model and giving it the sigma schedule for dense
 warm-up steps. ``SOL_ATTN=1`` installs a global override for CLI benchmarks.
+
+Which implementation runs is ``_backend``'s decision, not this module's: CUDA
+gets the Triton kernels, Apple Silicon and CPU get the portable PyTorch one.
+Everything here asks the backend what it will accept rather than testing for a
+device or a dtype itself.
 """
 
 import logging
@@ -20,25 +25,8 @@ from comfy.ldm.modules.attention import (
 from comfy.patcher_extension import CallbacksMP
 from comfy_api.latest import ComfyExtension, io
 
+from . import _backend
 from ._autotune_log import set_verbose as _set_autotune_verbose
-
-try:
-    from ._tri_fwd import sol_attn as _sol_attn_kernel, _has_tma
-    _IMPORT_ERROR = None
-except Exception as exc:  # triton / torch version issues
-    _sol_attn_kernel = None
-    _has_tma = None
-    _IMPORT_ERROR = exc
-
-try:
-    from ._int8_fwd import sol_attn_int8 as _sol_attn_int8_kernel
-    _INT8_IMPORT_ERROR = None
-except Exception as exc:
-    _sol_attn_int8_kernel = None
-    _INT8_IMPORT_ERROR = exc
-
-
-HEAD_DIM = 128
 
 _stats = {"sparse": 0, "dense_fallback": 0, "outside_range": 0,
           "dense_block": 0, "errors": 0}
@@ -167,16 +155,13 @@ def _log_kernel_failure(exc):
     logging.error(f"[sol_attn] kernel failed ({exc}); falling back", exc_info=first)
 
 
-def _ineligible(q, k, mask, dim_head, min_tokens):
+def _ineligible(backend, q, k, mask, dim_head, min_tokens):
     """Why this call can't use Sol-Attn, or None if it can. q/k are BTHD."""
-    if _sol_attn_kernel is None:
-        return f"kernel import failed: {_IMPORT_ERROR}"
-    if q.device.type != "cuda":
-        return "not cuda"
-    if q.dtype != torch.bfloat16:
-        return f"dtype {q.dtype} (kernel is bf16-only)"
-    if dim_head != HEAD_DIM:
-        return f"head_dim {dim_head} != 128"
+    if isinstance(backend, str):
+        return backend                       # no backend for this device
+    rejected = backend.rejects(q.dtype, dim_head)
+    if rejected is not None:
+        return rejected
     if mask is not None:
         return "masked attention"
     if q.shape[1] != k.shape[1]:
@@ -201,7 +186,8 @@ def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
         dim_head //= heads
         qs, ks, vs = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
 
-    reason = _ineligible(qs, ks, None, dim_head, min_tokens)
+    backend = _backend.select(qs.device)
+    reason = _ineligible(backend, qs, ks, None, dim_head, min_tokens)
     if reason is not None:
         _stats["dense_fallback"] += 1
         if verbose:
@@ -210,21 +196,23 @@ def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
 
     # No contiguous() here: the kernels take strides, so H3's interleaved qkv
     # views go in without copies.
-    extra = {"int8_pv": int8_pv} if int8_qk else {}
-    kernel = _sol_attn_int8_kernel if int8_qk else _sol_attn_kernel
-    out = kernel(
-        qs, ks, vs,
-        scale=scale, tau=tau, sink_blocks=sink_blocks, sink_q=sink_q,
-        use_tma=use_tma, **extra,
-    )  # BTHD
+    int8 = int8_qk and backend.supports_int8
+    if int8_qk and not int8:
+        _log_once(("no_int8", backend.name),
+                  f"int8_qk ignored: the {backend.name} backend has no INT8 path")
+    out = backend(qs, ks, vs, scale=scale, tau=tau, sink_blocks=sink_blocks,
+                  sink_q=sink_q, int8=int8, int8_pv=int8_pv,
+                  use_tma=use_tma)  # BTHD
     _stats["sparse"] += 1
     if verbose:
-        mode = "int8" if int8_qk else "bf16"
-        # The kernels also require SM90+ and a Triton with TensorDescriptor, so
-        # report the path actually taken rather than what was asked for.
-        path = "tma" if (use_tma and _has_tma(qs.device)) else "pointer"
-        _log_once((tuple(qs.shape), "sparse", mode, path),
-                  f"sparse {tuple(qs.shape)} tau={tau} {mode} {path}")
+        mode = "int8" if int8 else str(qs.dtype).rsplit(".", 1)[-1]
+        detail = f"{backend.name}/{mode}"
+        if backend.name == "triton":
+            # TMA also needs SM90+ and a Triton with TensorDescriptor, so report
+            # the path actually taken rather than what was asked for.
+            detail += " tma" if (use_tma and backend.has_tma(qs.device)) else " pointer"
+        _log_once((tuple(qs.shape), "sparse", detail),
+                  f"sparse {tuple(qs.shape)} tau={tau} {detail}")
 
     if skip_output_reshape:
         return out.transpose(1, 2)           # BHND
@@ -358,8 +346,10 @@ def _compose_module_patch(module, patched_forward):
         x = args[0] if args else None
         # KJNodes' low-VRAM block patch hands x over in a single-item list.
         tensor = x[0] if isinstance(x, list) and len(x) == 1 and torch.is_tensor(x[0]) else x
-        take = gate is not None and torch.is_tensor(tensor) and tensor.device.type == "cuda" \
-            and tensor.dtype == torch.bfloat16 and tensor.ndim in (2, 3)
+        backend = _backend.select(tensor.device) if torch.is_tensor(tensor) else None
+        take = gate is not None and torch.is_tensor(tensor) \
+            and not isinstance(backend, (str, type(None))) \
+            and tensor.dtype in backend.dtypes and tensor.ndim in (2, 3)
         if take:
             # H3 packs tokens first (s, dim); Wan/LTX2 are batch-first.
             tokens = tensor.shape[0] if tensor.ndim == 2 else tensor.shape[1]
@@ -429,13 +419,17 @@ class SolAttnPatch(io.ComfyNode):
             category="sol_attn",
             description="Sparsify self-attention with Sol-Attn (arXiv 2607.24027), with "
                         "optional Morton token reordering, INT8 QK, and an exact-KV sink "
-                        "for MiniMax-H3's packed conditioning rows. bf16 + head_dim 128 "
-                        "only; everything else falls back to the existing attention backend.",
+                        "for MiniMax-H3's packed conditioning rows. CUDA runs the Triton "
+                        "kernels (bf16, head_dim 128); Apple Silicon and CPU run a portable "
+                        "PyTorch implementation of the same algorithm (fp16/bf16/fp32, any "
+                        "head dim). Anything a backend declines falls back to the existing "
+                        "attention backend.",
             inputs=[
                 io.Model.Input("model"),
                 io.Float.Input("tau", default=1.3, min=0.0, max=4.0, step=0.05,
                                tooltip="Threshold beta. Higher is sparser: 1.0 ~ 16% of "
-                                       "blocks kept exact, 1.5 ~ 7%, 2.0 ~ 2.7%."),
+                                       "blocks kept exact, 1.5 ~ 7%, 2.0 ~ 2.7%. The same "
+                                       "densities hold on either backend."),
                 io.Float.Input("start_percent", default=0.2, min=0.0, max=1.0, step=0.01,
                                tooltip="Run dense before this point. The paper uses 0.2."),
                 io.Float.Input("end_percent", default=0.9, min=0.0, max=1.0, step=0.01),
@@ -445,7 +439,9 @@ class SolAttnPatch(io.ComfyNode):
                                  tooltip="INT8 QK in the exact branch (Sage-style: smoothed K, "
                                          "per-token scales). Measured free in quality; helps at "
                                          "tau<=1.5, a net loss at tau>=2.0 where the quantize "
-                                         "pass outweighs the shrinking exact branch."),
+                                         "pass outweighs the shrinking exact branch. CUDA only: "
+                                         "it exists to reach INT8 tensor cores, so the portable "
+                                         "backend ignores it and runs the same math without."),
                 io.Combo.Input("sink_conditioning", options=["exact_kv", "exact_kv_and_rows", "off"],
                                default="exact_kv_and_rows",
                                tooltip="MiniMax-H3 only. exact_kv: every query sees the packed "
@@ -469,7 +465,8 @@ class SolAttnPatch(io.ComfyNode):
                                  tooltip="Also run the exact branch's P@V in INT8, with a "
                                          "per-row P scale and per-channel V scale. PV and QK "
                                          "cost the same, so this is the other half of the "
-                                         "int8 win. Only applies when int8_qk is on."),
+                                         "int8 win. Only applies when int8_qk is on, and so "
+                                         "CUDA only."),
                 io.Boolean.Input("verbose", default=False),
                 io.Boolean.Input("use_tma", default=False,
                                  tooltip="Use the TMA descriptor kernels instead of the "
@@ -478,7 +475,8 @@ class SolAttnPatch(io.ComfyNode):
                                          "VRAM matches the pointer path. Off by default "
                                          "because it has not measured faster on any tested "
                                          "GPU. Requires SM90+ and Triton 3.3+; ignored "
-                                         "otherwise. 'verbose' logs the path used."),
+                                         "otherwise, and on the portable backend. 'verbose' "
+                                         "logs the backend and path used."),
                 io.String.Input("tau_profile", optional=True, force_input=True,
                                 tooltip="Per-block tau, overriding the base value. "
                                         "'blocks=tau' entries separated by ';' or newlines, "
@@ -505,10 +503,13 @@ class SolAttnPatch(io.ComfyNode):
                 min_tokens, int8_qk, sink_conditioning, morton,
                 morton_curve, dense_blocks, verbose,
                 tau_profile=None, use_tma=False, int8_pv=True) -> io.NodeOutput:
-        if _sol_attn_kernel is None:
-            raise RuntimeError(f"Sol-Attn kernel unavailable: {_IMPORT_ERROR}")
-        if int8_qk and _sol_attn_int8_kernel is None:
-            raise RuntimeError(f"Sol-Attn INT8 kernel unavailable: {_INT8_IMPORT_ERROR}")
+        # Report every device rather than gating on one: a model can move, and
+        # each call picks its backend from the tensors it actually gets.
+        report = _backend.status()
+        if all("unavailable" in line for line in report):
+            raise RuntimeError("Sol-Attn has no usable backend here -- "
+                               + "; ".join(report))
+        logging.info("[sol_attn] backends -- " + "; ".join(report))
 
         diffusion_model = model.get_model_object("diffusion_model")
         is_h3 = hasattr(diffusion_model, "rope_freqs") and hasattr(diffusion_model, "_forward")
@@ -666,8 +667,10 @@ def attention_sol(q, k, v, heads, mask=None, attn_precision=None,
 register_attention_function("sol_attn", attention_sol)
 
 if os.environ.get("SOL_ATTN", "0") not in ("0", "", "false"):
-    if _sol_attn_kernel is None:
-        logging.error(f"[sol_attn] SOL_ATTN set but kernel import failed: {_IMPORT_ERROR}")
+    _report = _backend.status()
+    if all("unavailable" in line for line in _report):
+        logging.error("[sol_attn] SOL_ATTN set but no backend is usable: "
+                      + "; ".join(_report))
     else:
         import comfy.ldm.modules.attention as _attn_mod
 
